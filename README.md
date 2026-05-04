@@ -128,20 +128,24 @@ ansible-playbook playbooks/05-disaster-recovery.yml -e confirm_dr=YES --ask-vaul
 terraform apply
 └─► Provisionnement VMs sur Proxmox
 └─► Cloud-init configure réseau, hostname, SSH
+
 ansible-playbook 00-bootstrap-pve
 └─► SSH vers HYDRA-01 (root)
 └─► Création user ansible@pve
 └─► Génération token API
 └─► Sauvegarde dans artifacts/
+
 ansible-playbook 01-deploy-pbs
 └─► Installation PBS sur VM-PBS
 └─► Montage NFS du NAS
 └─► Création datastore + user + token
 └─► Configuration GC, prune-job, verify-job
+
 ansible-playbook 02-integrate-pbs-pve
 └─► Lecture credentials PVE + PBS depuis artifacts/
 └─► Création storage PBS dans PVE (API)
 └─► Création de 3 jobs de backup (un par nœud)
+
 ansible-playbook 03-deploy-applications
 └─► Installation services métier (Nginx, PG, Samba)
 └─► Données de démo
