@@ -253,7 +253,7 @@ ls -lt artifacts/restore-tests/
 # Restauration de la VM 310 depuis le dernier backup
 ansible-playbook playbooks/05-disaster-recovery.yml -e confirm_dr=YES
 
-# Pour une autre VM
+# Pour une autre VM, il faut modifier le playbook ou bien adapter la commande
 ansible-playbook playbooks/05-disaster-recovery.yml \
   -e target_vmid=311 \
   -e target_vm_name=VM-DBSERV \
