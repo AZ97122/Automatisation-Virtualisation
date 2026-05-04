@@ -247,7 +247,7 @@ ls -lt artifacts/restore-tests/
 
 ## Disaster Recovery
 
-⚠️ **Cette procédure détruit la VM cible avant de la restaurer.**
+**Cette procédure détruit la VM cible avant de la restaurer.**
 
 ```bash
 # Restauration de la VM 310 depuis le dernier backup
