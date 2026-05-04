@@ -97,16 +97,14 @@ ansible-playbook playbooks/05-disaster-recovery.yml -e confirm_dr=YES --ask-vaul
 ### Information sensibles
 
 1. Clé SSH (seul secret manuel)  
-▼
 
-  2. Tokens API (générés dynamiquement) 
+2. Tokens API (générés dynamiquement) 
       • Token PVE pour Terraform         
       • Token PVE pour Ansible           
       • Token PBS pour PVE               
 
-▼
 
-   3. Mots de passe (Ansible Vault AES)  
+3. Mots de passe (Ansible Vault AES)  
       • Root PBS                         
       • User backup PBS                  
       • PostgreSQL appuser               
