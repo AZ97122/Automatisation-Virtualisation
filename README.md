@@ -2,6 +2,8 @@
 
 Automatisation d'une stratégie de sauvegarde pour cluster Proxmox Virtual Environment (PVE) avec Proxmox Backup Server (PBS), Terraform et Ansible.
 
+Documentations spécifiques disponibles dans le dossier Documentation
+
 ---
 
 ## Objectif
