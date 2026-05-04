@@ -96,8 +96,7 @@ ansible-playbook playbooks/05-disaster-recovery.yml -e confirm_dr=YES --ask-vaul
 
 ### Information sensibles
 
-1. Clé SSH (seul secret manuel)       │
-└──────────────────┬──────────────────────┘
+1. Clé SSH (seul secret manuel)  
 ▼
 ┌─────────────────────────────────────────┐
 │   2. Tokens API (générés dynamiquement) │
