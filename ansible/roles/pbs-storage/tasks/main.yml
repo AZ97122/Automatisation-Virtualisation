@@ -1,0 +1,127 @@
+---
+# ============================================================
+# Rôle pbs-storage
+# Gère le montage NFS et la création du datastore PBS
+# ============================================================
+
+- name: Installer le client NFS
+  ansible.builtin.apt:
+    name: nfs-common
+    state: present
+
+- name: Créer le point de montage
+  ansible.builtin.file:
+    path: "{{ pbs_datastore_path }}"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Monter le partage NFS du NAS
+  ansible.posix.mount:
+    src: "{{ nas_ip }}:{{ nas_nfs_export }}"
+    path: "{{ pbs_datastore_path }}"
+    fstype: nfs
+    opts: "defaults,_netdev,nfsvers=3"
+    state: mounted
+
+# ============================================================
+# Vérifications préalables
+# ============================================================
+
+- name: Lister les datastores PBS existants
+  ansible.builtin.command: proxmox-backup-manager datastore list --output-format json
+  register: datastore_list
+  changed_when: false
+
+- name: Vérifier si le datastore existe déjà
+  ansible.builtin.set_fact:
+    datastore_exists: "{{ pbs_datastore_name in (datastore_list.stdout | from_json | map(attribute='name') | list) }}"
+
+# ============================================================
+# Préparation du dossier (si datastore non existant)
+# Nettoyage et permissions
+# ============================================================
+
+- name: Supprimer la corbeille NAS si elle existe
+  ansible.builtin.file:
+    path: "{{ pbs_datastore_path }}/#recycle"
+    state: absent
+  when: not datastore_exists
+
+- name: Lister le contenu résiduel du dossier datastore
+  ansible.builtin.find:
+    paths: "{{ pbs_datastore_path }}"
+    file_type: any
+    hidden: yes
+  register: datastore_content
+  when: not datastore_exists
+
+- name: Nettoyer le dossier si nécessaire
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ datastore_content.files | default([]) }}"
+  when:
+    - not datastore_exists
+    - datastore_content.matched | default(0) | int > 0
+
+- name: Définir le bon propriétaire du datastore (user backup PBS)
+  ansible.builtin.file:
+    path: "{{ pbs_datastore_path }}"
+    owner: backup
+    group: backup
+    state: directory
+    mode: '0755'
+  when: not datastore_exists
+
+# ============================================================
+# Création du datastore
+# ============================================================
+
+- name: Créer le datastore PBS
+  ansible.builtin.command:
+    cmd: "proxmox-backup-manager datastore create {{ pbs_datastore_name }} {{ pbs_datastore_path }}"
+  when: not datastore_exists
+  register: datastore_create_result
+
+- name: Forcer les bonnes permissions sur le datastore après création
+  ansible.builtin.file:
+    path: "{{ pbs_datastore_path }}"
+    owner: backup
+    group: backup
+    recurse: yes
+    state: directory
+  when: not datastore_exists
+
+- name: Redémarrer les services PBS pour prendre en compte les permissions
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - proxmox-backup-proxy
+    - proxmox-backup
+  when: not datastore_exists
+
+- name: Attendre que les services PBS soient pleinement opérationnels
+  ansible.builtin.wait_for:
+    port: 8007
+    host: "{{ ansible_host }}"
+    delay: 2
+    timeout: 30
+  delegate_to: localhost
+  become: no
+  when: not datastore_exists
+
+# ============================================================
+# Vérification finale
+# ============================================================
+
+- name: Vérifier la création du datastore
+  ansible.builtin.command: "proxmox-backup-manager datastore show {{ pbs_datastore_name }}"
+  register: datastore_show
+  changed_when: false
+
+- name: Afficher les infos du datastore
+  ansible.builtin.debug:
+    msg: "{{ datastore_show.stdout_lines }}"

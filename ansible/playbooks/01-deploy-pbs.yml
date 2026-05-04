@@ -1,0 +1,79 @@
+---
+# ============================================================
+# Playbook de déploiement complet de PBS
+# ============================================================
+
+- name: Déploiement complet de Proxmox Backup Server
+  hosts: pbs_servers
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    # Configuration PBS
+    pbs_datastore_name: "main-datastore"
+    pbs_datastore_path: "/mnt/pbs-datastore"
+    pbs_backup_user: "backup@pbs"
+    
+    # NAS NFS
+    nas_ip: "192.168.100.250"
+    nas_nfs_export: "/volume1/pbs-datastore"
+    
+    # Identifiants secrets via Ansible Vault
+    pbs_root_password: "{{ vault_pbs_root_password }}"
+    pbs_admin_password: "{{ vault_pbs_admin_password }}"
+    pbs_backup_password: "{{ vault_pbs_backup_password }}"
+    
+    # Maintenance PBS - schedules (syntaxe systemd calendar event)
+    pbs_gc_schedule: "sun 03:00"          # GC tous les dimanches à 3h
+    pbs_prune_schedule: "02:30"            # Prune tous les jours à 2h30
+    pbs_verify_schedule: "sat 04:00"       # Verify tous les samedis à 4h
+    
+    # Maintenance PBS - rétention prune-job
+    pbs_keep_last: 2
+    pbs_keep_daily: 7
+    pbs_keep_weekly: 4
+    pbs_keep_monthly: 3
+  
+  vars_files:
+    - ../vault/secrets.yml
+  
+  pre_tasks:
+    - name: Mise à jour du cache apt
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+  
+  roles:
+    - pbs-install
+    - pbs-storage
+    - pbs-config
+  
+  post_tasks:
+    - name: Créer le dossier artifacts s'il n'existe pas (sur VM-MGMT)
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../artifacts"
+        state: directory
+        mode: '0755'
+        owner: debian
+        group: debian
+      delegate_to: localhost
+      become: yes
+    
+    - name: Récupérer les credentials PBS sur VM-MGMT
+      ansible.builtin.fetch:
+        src: /root/pbs-credentials.yml
+        dest: "{{ playbook_dir }}/../../artifacts/"
+        flat: no
+    
+    - name: Récap final
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════"
+          - "PBS déployé avec succès"
+          - "════════════════════════════════════════════════"
+          - "Interface : https://{{ ansible_host }}:8007"
+          - "Login admin : root@pam"
+          - "Datastore : {{ pbs_datastore_name }}"
+          - "Path : {{ pbs_datastore_path }}"
+          - "Credentials dans projet-backup-automation/artifacts/"
+          - "════════════════════════════════════════════════"

@@ -1,0 +1,8 @@
+---
+# Variables publiques pour le groupe pbs_servers
+# Pointent vers les variables vault chiffrées
+
+pbs_admin_password: "{{ vault_pbs_admin_password }}"
+pbs_backup_password: "{{ vault_pbs_backup_password }}"
+pbs_root_password: "{{ vault_pbs_root_password }}"
+pbs_backup_user: "backup@pbs"

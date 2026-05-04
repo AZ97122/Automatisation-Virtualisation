@@ -1,0 +1,41 @@
+---
+# ============================================================
+# Rôle webserver - Serveur web Nginx
+# ============================================================
+
+- name: Installer Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: yes
+
+- name: Démarrer et activer Nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: yes
+
+- name: Déployer la page d'accueil personnalisée
+  ansible.builtin.template:
+    src: index.html.j2
+    dest: /var/www/html/index.html
+    mode: '0644'
+    owner: www-data
+    group: www-data
+  notify: restart nginx
+
+- name: Vérifier si UFW est installé
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: ufw_binary
+
+- name: Ouvrir le port 80 dans le firewall (si UFW actif)
+  ansible.builtin.ufw:
+    rule: allow
+    port: '80'
+    proto: tcp
+  when: ufw_binary.stat.exists
+
+- name: Afficher l'URL d'accès
+  ansible.builtin.debug:
+    msg: "Serveur web prêt : http://{{ ansible_host }}/"

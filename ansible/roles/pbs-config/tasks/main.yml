@@ -1,0 +1,204 @@
+---
+# ============================================================
+# Rôle pbs-config
+# Configure l'utilisateur, les permissions et génère un token API
+# ============================================================
+
+# ============================================================
+# Configuration du mot de passe root pour PAM
+# ============================================================
+
+- name: Définir le mot de passe root pour l'authentification PAM
+  ansible.builtin.user:
+    name: root
+    password: "{{ pbs_root_password | password_hash('sha512') }}"
+    update_password: always
+  no_log: true
+
+# ============================================================
+# Création de l'utilisateur applicatif PBS
+# ============================================================
+
+- name: Lister les utilisateurs PBS existants
+  ansible.builtin.command: proxmox-backup-manager user list --output-format json
+  register: pbs_users
+  changed_when: false
+
+- name: Créer l'utilisateur backup pour PVE
+  ansible.builtin.command:
+    cmd: >
+      proxmox-backup-manager user create {{ pbs_backup_user }}
+      --password "{{ pbs_backup_password }}"
+  when: pbs_backup_user not in (pbs_users.stdout | from_json | map(attribute='userid') | list)
+  no_log: true
+
+- name: Donner les droits à l'utilisateur sur le datastore
+  ansible.builtin.command:
+    cmd: >
+      proxmox-backup-manager acl update /datastore/{{ pbs_datastore_name }}
+      DatastoreAdmin --auth-id {{ pbs_backup_user }}
+  changed_when: false
+
+# ============================================================
+# Gestion du token API
+# ============================================================
+
+- name: Lister les tokens existants pour l'utilisateur backup
+  ansible.builtin.command:
+    cmd: "proxmox-backup-manager user list-tokens {{ pbs_backup_user }} --output-format json"
+  register: existing_tokens
+  changed_when: false
+
+- name: Supprimer l'ancien token pve-token s'il existe (régénération propre)
+  ansible.builtin.command:
+    cmd: "proxmox-backup-manager user delete-token {{ pbs_backup_user }} pve-token"
+  when: "'pve-token' in (existing_tokens.stdout | from_json | map(attribute='tokenid') | map('regex_replace', '^.*!', '') | list)"
+
+- name: Générer un nouveau token API pour PVE
+  ansible.builtin.command:
+    cmd: "proxmox-backup-manager user generate-token {{ pbs_backup_user }} pve-token"
+  register: token_create
+  changed_when: true
+
+- name: Extraire le secret du token depuis la sortie
+  ansible.builtin.set_fact:
+    pbs_token_secret: "{{ token_create.stdout | regex_search('\"value\"\\s*:\\s*\"([^\"]+)\"', '\\1') | first }}"
+    pbs_token_id: "{{ pbs_backup_user }}!pve-token"
+
+- name: Donner les droits du token sur le datastore
+  ansible.builtin.command:
+    cmd: >
+      proxmox-backup-manager acl update /datastore/{{ pbs_datastore_name }}
+      DatastoreAdmin --auth-id {{ pbs_token_id }}
+  changed_when: false
+
+# ============================================================
+# Récupération du fingerprint du certificat
+# ============================================================
+
+- name: Récupérer le fingerprint du certificat PBS
+  ansible.builtin.shell: >
+    proxmox-backup-manager cert info | grep -i fingerprint | awk '{print $NF}'
+  register: pbs_fingerprint_raw
+  changed_when: false
+
+- name: Stocker le fingerprint en fact
+  ansible.builtin.set_fact:
+    pbs_fingerprint: "{{ pbs_fingerprint_raw.stdout }}"
+
+# ============================================================
+# Sauvegarde des credentials
+# ============================================================
+
+- name: Créer un fichier credentials propre pour utilisation ultérieure
+  ansible.builtin.copy:
+    content: |
+      ---
+      # Credentials PBS générés automatiquement
+      # Date de génération : {{ ansible_date_time.iso8601 }}
+      # Hôte PBS : {{ ansible_host }}
+      
+      pbs_host: "{{ ansible_host }}"
+      pbs_port: 8007
+      pbs_datastore: "{{ pbs_datastore_name }}"
+      pbs_token_id: "{{ pbs_token_id }}"
+      pbs_token_secret: "{{ pbs_token_secret }}"
+      pbs_fingerprint: "{{ pbs_fingerprint }}"
+    dest: /root/pbs-credentials.yml
+    mode: '0600'
+
+- name: Afficher les credentials du token (visible UNE seule fois)
+  ansible.builtin.debug:
+    msg:
+      - "════════════════════════════════════════════════"
+      - "TOKEN PBS GÉNÉRÉ"
+      - "════════════════════════════════════════════════"
+      - "Token ID    : {{ pbs_token_id }}"
+      - "Fingerprint : {{ pbs_fingerprint }}"
+      - "════════════════════════════════════════════════"
+      - "Sauvegarde dans /root/pbs-credentials.yml sur PBS"
+      - "Sera recupere dans artifacts/ par le playbook"
+
+# ============================================================
+# Configuration du Garbage Collection
+# (configuration sur le datastore directement)
+# ============================================================
+
+- name: Configurer le garbage collection schedule
+  ansible.builtin.command:
+    cmd: "proxmox-backup-manager datastore update {{ pbs_datastore_name }} --gc-schedule '{{ pbs_gc_schedule }}'"
+  changed_when: true
+
+# ============================================================
+# Job de prune (rétention)
+# Utilise le modèle "prune-job" des versions récentes de PBS
+# ============================================================
+
+- name: Lister les jobs prune existants
+  ansible.builtin.command: "proxmox-backup-manager prune-job list --output-format json"
+  register: prune_jobs
+  changed_when: false
+  failed_when: false
+
+- name: Identifier le job prune Ansible
+  ansible.builtin.set_fact:
+    prune_job_exists: "{{ prune_jobs.rc == 0 and ('prune-' + pbs_datastore_name) in (prune_jobs.stdout | from_json | default([]) | map(attribute='id') | list) }}"
+
+- name: Supprimer l'ancien prune-job s'il existe (mise à jour declarative)
+  ansible.builtin.command:
+    cmd: "proxmox-backup-manager prune-job remove prune-{{ pbs_datastore_name }}"
+  when: prune_job_exists
+  failed_when: false
+
+- name: Créer un job de prune avec rétention
+  ansible.builtin.command:
+    cmd: >
+      proxmox-backup-manager prune-job create prune-{{ pbs_datastore_name }}
+      --store {{ pbs_datastore_name }}
+      --schedule '{{ pbs_prune_schedule }}'
+      --keep-last {{ pbs_keep_last }}
+      --keep-daily {{ pbs_keep_daily }}
+      --keep-weekly {{ pbs_keep_weekly }}
+      --keep-monthly {{ pbs_keep_monthly }}
+      --comment "Prune job - geree par Ansible"
+
+# ============================================================
+# Job de vérification d'intégrité
+# Détecte les corruptions de chunks
+# ============================================================
+
+- name: Lister les jobs verify existants
+  ansible.builtin.command: "proxmox-backup-manager verify-job list --output-format json"
+  register: verify_jobs
+  changed_when: false
+  failed_when: false
+
+- name: Identifier le job verify Ansible
+  ansible.builtin.set_fact:
+    verify_job_exists: "{{ verify_jobs.rc == 0 and ('verify-' + pbs_datastore_name) in (verify_jobs.stdout | from_json | default([]) | map(attribute='id') | list) }}"
+
+- name: Créer un job de vérification d'intégrité
+  ansible.builtin.command:
+    cmd: >
+      proxmox-backup-manager verify-job create verify-{{ pbs_datastore_name }}
+      --store {{ pbs_datastore_name }}
+      --schedule '{{ pbs_verify_schedule }}'
+      --comment "Verification integrite hebdomadaire - geree par Ansible"
+  when: not verify_job_exists
+  failed_when: false
+
+# ============================================================
+# Récap de la configuration de maintenance
+# ============================================================
+
+- name: Afficher la configuration de maintenance
+  ansible.builtin.debug:
+    msg:
+      - "════════════════════════════════════════════════"
+      - "MAINTENANCE PBS CONFIGURÉE"
+      - "════════════════════════════════════════════════"
+      - "Garbage Collection : {{ pbs_gc_schedule }}"
+      - "✂️  Prune Job        : {{ pbs_prune_schedule }}"
+      - "    └─ Rétention : {{ pbs_keep_last }}/{{ pbs_keep_daily }}/{{ pbs_keep_weekly }}/{{ pbs_keep_monthly }}"
+      - "Verify Job        : {{ pbs_verify_schedule }}"
+      - "════════════════════════════════════════════════"

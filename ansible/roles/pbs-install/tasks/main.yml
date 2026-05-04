@@ -1,0 +1,59 @@
+---
+- name: Installer les dépendances de base
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg2
+      - ca-certificates
+    state: present
+    update_cache: yes
+  ignore_errors: yes
+
+- name: Désactiver le dépôt PBS enterprise (pas de licence)
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/pbs-enterprise.list
+    state: absent
+
+- name: Désactiver le dépôt PVE enterprise (au cas où)
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/pve-enterprise.list
+    state: absent
+
+- name: Désactiver le dépôt CEPH enterprise (au cas où)
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/ceph.list
+    state: absent
+
+- name: Télécharger la clé GPG du dépôt Proxmox
+  ansible.builtin.get_url:
+    url: https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
+    dest: /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+    mode: '0644'
+
+- name: Ajouter le dépôt PBS no-subscription
+  ansible.builtin.copy:
+    content: "deb http://download.proxmox.com/debian/pbs bookworm pbs-no-subscription\n"
+    dest: /etc/apt/sources.list.d/pbs-no-subscription.list
+    mode: '0644'
+
+- name: Mettre à jour le cache apt
+  ansible.builtin.apt:
+    update_cache: yes
+
+- name: Installer Proxmox Backup Server
+  ansible.builtin.apt:
+    name: proxmox-backup-server
+    state: present
+
+- name: S'assurer que les services PBS sont actifs
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: yes
+    state: started
+  loop:
+    - proxmox-backup
+    - proxmox-backup-proxy
+
+- name: Afficher l'URL de l'interface PBS
+  ansible.builtin.debug:
+    msg: "PBS installé - Interface : https://{{ ansible_host }}:8007"

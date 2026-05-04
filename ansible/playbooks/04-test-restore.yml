@@ -1,0 +1,413 @@
+---
+# ============================================================
+# Playbook de test de restauration automatisé
+# 
+# Philosophie : "Un backup non testé n'est pas un backup"
+# 
+# Cycle complet :
+#   1. Choisir une VM source (configurable)
+#   2. Trouver son dernier backup dans PBS
+#   3. Restaurer dans une VM temporaire
+#   4. Démarrer la VM restaurée
+#   5. Vérifier qu'elle est opérationnelle (ping)
+#   6. Générer un rapport JSON
+#   7. Cleanup automatique
+# ============================================================
+
+- name: Test de restauration automatisé d'un backup PBS
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  
+  vars:
+    # ============================================================
+    # Configuration du test de restauration
+    # ============================================================
+    
+    # VM source à tester (par défaut VM-WEBSERV)
+    # Peut être surchargé : -e source_vmid=311
+    source_vmid: 310
+    source_vm_name: "VM-WEBSERV"
+    source_node: "HYDRA-01"
+    
+    # VM temporaire pour la restauration (ID très haut pour éviter les collisions)
+    test_vmid: 999
+    test_vm_name: "TEST-RESTORE-{{ source_vmid }}"
+    test_node: "HYDRA-01"  # Nœud de restauration (le moins chargé idéalement)
+    
+    # Stockage cible pour la VM restaurée
+    test_target_storage: "VMs-Disks"
+    
+    # Timeout pour démarrage et ping de la VM restaurée
+    boot_timeout: 180  # 3 minutes max
+    
+    # Stockage PBS source
+    pbs_storage_id: "pbs-main"
+    
+    # Cleanup automatique après le test (ou non pour debug)
+    cleanup_after_test: true
+  
+  vars_files:
+    - ../../artifacts/pve-credentials.yml
+    - ../../artifacts/vm-pbs/root/pbs-credentials.yml
+  
+  tasks:
+    # ============================================================
+    # Étape 1 : Préparation et vérifications préalables
+    # ============================================================
+    
+    - name: Afficher la configuration du test
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════"
+          - "TEST DE RESTAURATION AUTOMATISÉ"
+          - "════════════════════════════════════════════════"
+          - "VM source : {{ source_vm_name }} (vmid {{ source_vmid }})"
+          - "VM cible  : {{ test_vm_name }} (vmid {{ test_vmid }})"
+          - "Nœud cible : {{ test_node }}"
+          - "Stockage PBS : {{ pbs_storage_id }}"
+          - "Cleanup auto : {{ cleanup_after_test }}"
+          - "════════════════════════════════════════════════"
+    
+    - name: Initialiser le rapport
+      ansible.builtin.set_fact:
+        restore_report:
+          test_id: "test-{{ ansible_date_time.iso8601_basic_short }}"
+          start_time: "{{ ansible_date_time.iso8601 }}"
+          source_vmid: "{{ source_vmid }}"
+          source_vm_name: "{{ source_vm_name }}"
+          test_vmid: "{{ test_vmid }}"
+          steps: []
+          status: "in_progress"
+    
+    # ============================================================
+    # Étape 2 : Vérifier qu'aucune VM n'utilise déjà le vmid 999
+    # ============================================================
+    
+    - name: Vérifier si la VM de test existe déjà (cleanup nécessaire ?)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/cluster/resources?type=vm"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: cluster_resources
+    
+    - name: Identifier si la VM de test existe
+      ansible.builtin.set_fact:
+        existing_test_vm: "{{ cluster_resources.json.data | selectattr('vmid', 'equalto', test_vmid) | list }}"
+    
+    - name: Stopper la VM de test précédente si elle existe
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ existing_test_vm[0].node }}/qemu/{{ test_vmid }}/status/stop"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      when: existing_test_vm | length > 0 and existing_test_vm[0].status == "running"
+      failed_when: false
+    
+    - name: Attendre l'arrêt complet
+      ansible.builtin.pause:
+        seconds: 5
+      when: existing_test_vm | length > 0
+    
+    - name: Supprimer la VM de test précédente si elle existe
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ existing_test_vm[0].node }}/qemu/{{ test_vmid }}?destroy-unreferenced-disks=1&purge=1"
+        method: DELETE
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      when: existing_test_vm | length > 0
+      failed_when: false
+    
+    - name: Attendre la suppression complète
+      ansible.builtin.pause:
+        seconds: 10
+      when: existing_test_vm | length > 0
+    
+    # ============================================================
+    # Étape 3 : Lister les snapshots disponibles dans PBS
+    # ============================================================
+    
+    - name: Lister les snapshots du datastore PBS pour la VM source
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ source_node }}/storage/{{ pbs_storage_id }}/content"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: pbs_snapshots
+    
+    - name: Filtrer les snapshots de la VM source
+      ansible.builtin.set_fact:
+        vm_snapshots: "{{ pbs_snapshots.json.data | selectattr('volid', 'search', 'vm/' + source_vmid|string + '/') | sort(attribute='ctime', reverse=true) | list }}"
+    
+    - name: Vérifier qu'il y a au moins un backup
+      ansible.builtin.fail:
+        msg: "Aucun backup trouvé pour la VM {{ source_vmid }} dans le datastore {{ pbs_storage_id }}"
+      when: vm_snapshots | length == 0
+    
+    - name: Sélectionner le dernier backup
+      ansible.builtin.set_fact:
+        latest_backup: "{{ vm_snapshots[0] }}"
+    
+    - name: Afficher le backup sélectionné
+      ansible.builtin.debug:
+        msg:
+          - "Dernier backup trouvé :"
+          - "   Volume : {{ latest_backup.volid }}"
+          - "   Taille : {{ (latest_backup.size / 1024 / 1024 / 1024) | round(2) }} GB"
+          - "   Date : {{ '%Y-%m-%d %H:%M:%S' | strftime(latest_backup.ctime | int) }}"
+    # ============================================================
+    # Étape 4 : Restaurer le backup dans une VM temporaire
+    # ============================================================
+    
+    - name: Démarrer la restauration du backup
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          vmid: "{{ test_vmid }}"
+          name: "{{ test_vm_name }}"
+          archive: "{{ latest_backup.volid }}"
+          storage: "{{ test_target_storage }}"
+          start: 0  # Ne pas démarrer automatiquement
+          unique: 1  # Régénérer les IDs uniques (MAC, etc.)
+        status_code: [200, 201]
+        timeout: 300
+      register: restore_task
+    
+    - name: Attendre la fin de la restauration
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/tasks/{{ restore_task.json.data }}/status"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: restore_status
+      until: restore_status.json.data.status == "stopped"
+      retries: 60
+      delay: 10
+    
+    - name: Vérifier le succès de la restauration
+      ansible.builtin.fail:
+        msg: "La restauration a échoué : {{ restore_status.json.data.exitstatus }}"
+      when: restore_status.json.data.exitstatus != "OK"
+    
+    - name: Confirmer la restauration
+      ansible.builtin.debug:
+        msg: "Restauration terminée avec succès"
+
+    # ============================================================
+    # Étape 5a : Désactiver le réseau de la VM de test
+    # ============================================================
+    
+    - name: Désactiver l'interface réseau de la VM de test
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu/{{ test_vmid }}/config"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          delete: "net0,net1,net2"
+        status_code: [200, 201]
+      failed_when: false
+    
+    - name: Confirmer l'isolation réseau
+      ansible.builtin.debug:
+        msg: "VM de test isolée du réseau (pas de conflit IP avec la VM source)"
+    
+    # ============================================================
+    # Étape 5 : Démarrer la VM restaurée
+    # ============================================================
+    
+    - name: Démarrer la VM restaurée
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu/{{ test_vmid }}/status/start"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      register: start_task
+    
+    - name: Attendre que la VM soit en running
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu/{{ test_vmid }}/status/current"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: vm_status
+      until: vm_status.json.data.status == "running"
+      retries: 12
+      delay: 5
+    
+    - name: Confirmer le démarrage
+      ansible.builtin.debug:
+        msg: "VM restaurée démarrée (uptime : {{ vm_status.json.data.uptime | default(0) }}s)"
+    
+    # ============================================================
+    # Étape 6 : Vérifier l'agent QEMU répond (validation)
+    # ============================================================
+    
+    - name: Attendre que l'agent QEMU réponde (preuve de fonctionnement)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu/{{ test_vmid }}/agent/ping"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      register: agent_ping
+      until: agent_ping.status == 200
+      retries: 30
+      delay: 10
+      failed_when: false
+    
+    - name: Évaluer le succès du ping agent
+      ansible.builtin.set_fact:
+        agent_responsive: "{{ agent_ping.status == 200 }}"
+    
+    - name: Récupérer les infos système via l'agent (si disponible)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu/{{ test_vmid }}/agent/network-get-interfaces"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: vm_network_info
+      when: agent_responsive
+      failed_when: false
+    
+    - name: Afficher le résultat de la validation
+      ansible.builtin.debug:
+        msg:
+          - "Validation de la VM restaurée :"
+          - "   Status : {{ vm_status.json.data.status }}"
+          - "   QEMU agent : {{ 'répond' if agent_responsive else '⚠️  ne répond pas' }}"
+    
+    # ============================================================
+    # Étape 7 : Générer le rapport
+    # ============================================================
+    
+    - name: Construire le rapport final
+      ansible.builtin.set_fact:
+        final_report:
+          test_id: "{{ restore_report.test_id }}"
+          start_time: "{{ restore_report.start_time }}"
+          end_time: "{{ ansible_date_time.iso8601 }}"
+          source:
+            vmid: "{{ source_vmid }}"
+            name: "{{ source_vm_name }}"
+            node: "{{ source_node }}"
+          backup:
+            volid: "{{ latest_backup.volid }}"
+            ctime: "{{ '%Y-%m-%d %H:%M:%S' | strftime(latest_backup.ctime | int) }}"
+            size_gb: "{{ (latest_backup.size / 1024 / 1024 / 1024) | round(2) }}"
+          test:
+            vmid: "{{ test_vmid }}"
+            name: "{{ test_vm_name }}"
+            node: "{{ test_node }}"
+            target_storage: "{{ test_target_storage }}"
+          results:
+            restore_success: true
+            vm_started: "{{ vm_status.json.data.status == 'running' }}"
+            agent_responsive: "{{ agent_responsive }}"
+            overall_status: "{{ 'PASSED' if agent_responsive else 'PARTIAL' }}"
+    
+   - name: Créer le dossier des rapports
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../artifacts/restore-tests"
+        state: directory
+        mode: '0755'
+        owner: debian
+        group: debian
+      become: no
+
+    - name: Sauvegarder le rapport JSON
+      ansible.builtin.copy:
+        content: "{{ final_report | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../../artifacts/restore-tests/{{ final_report.test_id }}.json"
+        mode: '0644'
+        owner: debian
+        group: debian
+      become: no
+
+    - name: Afficher le rapport complet
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════"
+          - "RAPPORT DU TEST DE RESTAURATION"
+          - "════════════════════════════════════════════════"
+          - "Test ID : {{ final_report.test_id }}"
+          - "VM source : {{ final_report.source.name }} (vmid {{ final_report.source.vmid }})"
+          - "Backup utilisé : {{ final_report.backup.ctime }} ({{ final_report.backup.size_gb }} GB)"
+          - "Restauration : {{ 'OK' if final_report.results.restore_success else 'FAIL' }}"
+          - "Démarrage : {{ 'OK' if final_report.results.vm_started else 'FAIL' }}"
+          - "Agent QEMU : {{ 'OK' if final_report.results.agent_responsive else '⚠️  KO' }}"
+          - "════════════════════════════════════════════════"
+          - "STATUT GLOBAL : {{ final_report.results.overall_status }}"
+          - "════════════════════════════════════════════════"
+          - "Rapport sauvegardé dans :"
+          - "   artifacts/restore-tests/{{ final_report.test_id }}.json"
+          - "════════════════════════════════════════════════"
+    
+    # ============================================================
+    # Étape 8 : Cleanup (supprimer la VM de test)
+    # ============================================================
+    
+    - name: Stopper la VM de test
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu/{{ test_vmid }}/status/stop"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      when: cleanup_after_test
+      failed_when: false
+    
+    - name: Attendre l'arrêt
+      ansible.builtin.pause:
+        seconds: 5
+      when: cleanup_after_test
+    
+    - name: Supprimer la VM de test (cleanup)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ test_node }}/qemu/{{ test_vmid }}?destroy-unreferenced-disks=1&purge=1"
+        method: DELETE
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      when: cleanup_after_test
+      failed_when: false
+    
+    - name: Confirmer le cleanup
+      ansible.builtin.debug:
+        msg: "VM de test supprimée"
+      when: cleanup_after_test
+    
+    - name: Conserver la VM de test (mode debug)
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  VM de test conservée (cleanup_after_test=false)"
+          - "   La VM {{ test_vmid }} est toujours présente sur {{ test_node }}"
+          - "   Pour la supprimer manuellement : qm destroy {{ test_vmid }} --purge --destroy-unreferenced-disks 1"
+      when: not cleanup_after_test

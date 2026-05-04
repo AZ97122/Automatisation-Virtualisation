@@ -1,0 +1,101 @@
+---
+# ============================================================
+# Playbook de bootstrap PVE
+# Crée un user et un token API dédiés à Ansible
+# ============================================================
+
+- name: Bootstrap initial - Création du token PVE pour Ansible
+  hosts: pve_cluster
+  gather_facts: yes
+  
+  vars:
+    pve_user: "ansible@pve"
+    pve_token_name: "ans-token"
+    pve_role: "Administrator"
+  
+  tasks:
+    - name: Lister les utilisateurs PVE existants
+      ansible.builtin.command: "pveum user list --output-format json"
+      register: pve_users_raw
+      changed_when: false
+    
+    - name: Créer l'utilisateur ansible@pve si inexistant
+      ansible.builtin.command:
+        cmd: "pveum user add {{ pve_user }}"
+      when: pve_user not in (pve_users_raw.stdout | from_json | map(attribute='userid') | list)
+    
+    - name: Donner les droits PVEAdmin à ansible@pve sur tout le cluster
+      ansible.builtin.command:
+        cmd: "pveum aclmod / --users {{ pve_user }} --roles {{ pve_role }}"
+      changed_when: false
+    
+    - name: Lister les tokens existants pour ansible@pve
+      ansible.builtin.command:
+        cmd: "pveum user token list {{ pve_user }} --output-format json"
+      register: ans_tokens
+      changed_when: false
+    
+    - name: Supprimer l'ancien token s'il existe (régénération propre)
+      ansible.builtin.command:
+        cmd: "pveum user token remove {{ pve_user }} {{ pve_token_name }}"
+      when: pve_token_name in (ans_tokens.stdout | from_json | map(attribute='tokenid') | list)
+    
+    - name: Générer un nouveau token API pour Ansible
+      ansible.builtin.command:
+        cmd: "pveum user token add {{ pve_user }} {{ pve_token_name }} --privsep=0 --output-format json"
+      register: token_create
+    
+    - name: Extraire le secret du token
+      ansible.builtin.set_fact:
+        pve_token_id: "{{ pve_user }}!{{ pve_token_name }}"
+        pve_token_secret: "{{ (token_create.stdout | from_json).value }}"
+    
+    # ============================================================
+    # Sauvegarde des credentials sur le control node
+    # ============================================================
+    
+    - name: Créer le dossier artifacts sur VM-MGMT
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../artifacts"
+        state: directory
+        mode: '0755'
+        owner: debian
+        group: debian
+      delegate_to: localhost
+      become: yes
+      run_once: yes
+    
+    - name: Sauvegarder les credentials PVE sur VM-MGMT
+      ansible.builtin.copy:
+        content: |
+          ---
+          # Credentials PVE générés automatiquement par Ansible
+          # Date : {{ ansible_date_time.iso8601 }}
+          # Cluster : {{ ansible_host }}
+          
+          pve_host: "{{ ansible_host }}"
+          pve_port: 8006
+          pve_token_id: "{{ pve_token_id }}"
+          pve_token_secret: "{{ pve_token_secret }}"
+          pve_user: "{{ pve_user }}"
+          pve_token_name: "{{ pve_token_name }}"
+        dest: "{{ playbook_dir }}/../../artifacts/pve-credentials.yml"
+        mode: '0600'
+        owner: debian
+        group: debian
+      delegate_to: localhost
+      become: yes
+      run_once: yes
+    
+    - name: Afficher les credentials PVE
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════"
+          - "TOKEN PVE GÉNÉRÉ"
+          - "════════════════════════════════════════════════"
+          - "Token ID : {{ pve_token_id }}"
+          - "Secret   : ***** voir fichier artifacts/pve-credentials.yml"
+          - "════════════════════════════════════════════════"
+          - "sauvegardé dans projet-backup-automation/artifacts/pve-credentials.yml"
+          - "════════════════════════════════════════════════"
+      run_once: yes

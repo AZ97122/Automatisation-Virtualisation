@@ -1,0 +1,66 @@
+---
+# ============================================================
+# Playbook de déploiement des applications
+# ============================================================
+
+- name: Préparation des VMs applicatives
+  hosts: backup_clients
+  become: yes
+  gather_facts: yes
+  
+  vars_files:
+    - ../vault/secrets.yml
+  
+  vars:
+    db_app_password: "{{ vault_db_app_password }}"
+  
+  pre_tasks:
+    - name: Mise à jour du cache apt
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+- name: Déploiement des serveurs web
+  hosts: backup_clients
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../vault/secrets.yml
+  vars:
+    db_app_password: "{{ vault_db_app_password }}"
+  roles:
+    - role: webserver
+      when: backup_role == "web"
+
+- name: Déploiement des bases de données
+  hosts: backup_clients
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../vault/secrets.yml
+  vars:
+    db_app_password: "{{ vault_db_app_password }}"
+  roles:
+    - role: database
+      when: backup_role == "database"
+
+- name: Déploiement des serveurs de fichiers
+  hosts: backup_clients
+  become: yes
+  gather_facts: yes
+  roles:
+    - role: fileserver
+      when: backup_role == "fileserver"
+
+- name: Récap des services déployés
+  hosts: backup_clients
+  gather_facts: no
+  tasks:
+    - name: Afficher les infos de chaque VM
+      ansible.builtin.debug:
+        msg:
+          - "═══════════════════════════════════════"
+          - "VM : {{ inventory_hostname }}"
+          - "Rôle : {{ backup_role }}"
+          - "IP : {{ ansible_host }}"
+          - "═══════════════════════════════════════"

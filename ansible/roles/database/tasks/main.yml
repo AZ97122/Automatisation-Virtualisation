@@ -1,0 +1,94 @@
+---
+# ============================================================
+# Rôle database - PostgreSQL
+# ============================================================
+
+- name: Installer PostgreSQL et dépendances
+  ansible.builtin.apt:
+    name:
+      - postgresql
+      - postgresql-contrib
+      - python3-psycopg2
+    state: present
+    update_cache: yes
+
+- name: Démarrer et activer PostgreSQL
+  ansible.builtin.systemd:
+    name: postgresql
+    state: started
+    enabled: yes
+
+- name: Configurer PostgreSQL pour écouter sur toutes les interfaces
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql/15/main/postgresql.conf
+    regexp: "^#?listen_addresses\\s*="
+    line: "listen_addresses = '*'"
+  notify: restart postgresql
+
+- name: Autoriser les connexions distantes du subnet
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql/15/main/pg_hba.conf
+    line: "host    all             all             192.168.100.0/24            md5"
+    state: present
+  notify: restart postgresql
+
+- name: Forcer le redémarrage immédiat de PostgreSQL si conf modifiée
+  ansible.builtin.meta: flush_handlers
+
+# ============================================================
+# Création de l'utilisateur AVANT la BDD
+# (pour pouvoir le définir comme propriétaire)
+# ============================================================
+
+- name: Créer l'utilisateur applicatif
+  community.postgresql.postgresql_user:
+    name: appuser
+    password: "{{ db_app_password }}"
+    state: present
+  become_user: postgres
+  become: yes
+  no_log: true
+
+- name: Créer la base de données avec appuser comme propriétaire
+  community.postgresql.postgresql_db:
+    name: demo_backup
+    owner: appuser
+    state: present
+  become_user: postgres
+  become: yes
+
+# ============================================================
+# Création de la structure et des données
+# ============================================================
+
+- name: Créer une table de démo
+  community.postgresql.postgresql_query:
+    login_db: demo_backup
+    login_user: appuser
+    login_password: "{{ db_app_password }}"
+    login_host: 127.0.0.1
+    query: |
+      CREATE TABLE IF NOT EXISTS visitors (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100),
+        visited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+- name: Insérer des données de démo
+  community.postgresql.postgresql_query:
+    login_db: demo_backup
+    login_user: appuser
+    login_password: "{{ db_app_password }}"
+    login_host: 127.0.0.1
+    query: |
+      INSERT INTO visitors (name) VALUES 
+        ('Alice'), ('Bob'), ('Charlie'), ('Diana'), ('Eve')
+      ON CONFLICT DO NOTHING;
+
+- name: Afficher les infos de la BDD
+  ansible.builtin.debug:
+    msg:
+      - "Base de données prête !"
+      - "Host : {{ ansible_host }}:5432"
+      - "DB : demo_backup"
+      - "User : appuser (propriétaire)"

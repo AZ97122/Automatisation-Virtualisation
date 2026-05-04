@@ -1,0 +1,211 @@
+---
+# ============================================================
+# Playbook d'intégration PBS ↔ PVE
+# - Déclare PBS comme storage de backup dans PVE
+# - Crée 1 job de backup par nœud (multi-nœuds PVE 9)
+# ============================================================
+
+- name: Intégration PBS dans le cluster Proxmox VE
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  
+  vars:
+    # Configuration du storage PBS dans PVE
+    pve_storage_id: "pbs-main"
+    pve_storage_content: "backup"
+    
+    # Configuration des jobs de backup
+    backup_schedule: "01:00"             # Tous les jours à 1h du matin
+    backup_compression: "zstd"           # Compression rapide
+    
+    # Mapping VM ↔ nœud (un job par nœud pour PVE 9)
+    backup_vms_per_node:
+      - node: "HYDRA-01"
+        vmids: [310]      # VM-WEBSERV
+      - node: "HYDRA-03"
+        vmids: [311]      # VM-DBSERV
+      - node: "HYDRA-04"
+        vmids: [312]      # VM-FILESERV
+    
+    # Politique de rétention (côté job PVE)
+    backup_retention:
+      keep_last: 2
+      keep_daily: 7
+      keep_weekly: 4
+      keep_monthly: 3
+  
+  vars_files:
+    - ../../artifacts/pve-credentials.yml
+    - ../../artifacts/vm-pbs/root/pbs-credentials.yml
+  
+  tasks:
+    # ============================================================
+    # 1. Vérifier les credentials chargés
+    # ============================================================
+    
+    - name: Afficher les infos chargées (sans secrets)
+      ansible.builtin.debug:
+        msg:
+          - "PVE Host : {{ pve_host }}"
+          - "PVE Token ID : {{ pve_token_id }}"
+          - "PBS Host : {{ pbs_host }}"
+          - "PBS Token ID : {{ pbs_token_id }}"
+          - "PBS Datastore : {{ pbs_datastore }}"
+          - "PBS Fingerprint : {{ pbs_fingerprint }}"
+    
+    # ============================================================
+    # 2. Vérifier si le storage PBS est déjà déclaré dans PVE
+    # ============================================================
+    
+    - name: Lister les storages existants dans PVE
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/storage"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: pve_storages
+    
+    - name: Vérifier si le storage PBS existe déjà
+      ansible.builtin.set_fact:
+        pbs_storage_exists: "{{ pve_storage_id in (pve_storages.json.data | map(attribute='storage') | list) }}"
+    
+    - name: Afficher l'état du storage PBS
+      ansible.builtin.debug:
+        msg: "Storage PBS '{{ pve_storage_id }}' déjà déclaré : {{ pbs_storage_exists }}"
+    
+   # ============================================================
+    # 3. Créer ou mettre à jour le storage PBS dans PVE
+    # ============================================================
+    
+    - name: Déclarer PBS comme storage de backup dans PVE (création)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/storage"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          storage: "{{ pve_storage_id }}"
+          type: "pbs"
+          server: "{{ pbs_host }}"
+          datastore: "{{ pbs_datastore }}"
+          username: "{{ pbs_token_id }}"
+          password: "{{ pbs_token_secret }}"
+          fingerprint: "{{ pbs_fingerprint }}"
+          content: "{{ pve_storage_content }}"
+        status_code: [200, 201]
+      when: not pbs_storage_exists
+    
+    - name: Mettre à jour le storage PBS existant (token, fingerprint)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/storage/{{ pve_storage_id }}"
+        method: PUT
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          username: "{{ pbs_token_id }}"
+          password: "{{ pbs_token_secret }}"
+          fingerprint: "{{ pbs_fingerprint }}"
+        status_code: [200, 201]
+      when: pbs_storage_exists
+    
+    - name: Confirmer la création/mise à jour du storage
+      ansible.builtin.debug:
+        msg: "Storage PBS {{ 'mis à jour' if pbs_storage_exists else 'créé' }} : {{ pve_storage_id }}"
+
+    # ============================================================
+    # 4. Gestion des jobs de backup (suppression des anciens)
+    # ============================================================
+    
+    - name: Lister les jobs de backup existants
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/cluster/backup"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: backup_jobs
+    
+    - name: Identifier les jobs Ansible existants
+      ansible.builtin.set_fact:
+        existing_ansible_jobs: "{{ backup_jobs.json.data | selectattr('comment', 'defined') | selectattr('comment', 'match', '^Job géré par Ansible.*') | list }}"
+    
+    - name: Afficher le nombre de jobs Ansible existants
+      ansible.builtin.debug:
+        msg: "Jobs Ansible existants : {{ existing_ansible_jobs | length }}"
+    
+    - name: Supprimer les anciens jobs Ansible (mise à jour declarative)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/cluster/backup/{{ item.id }}"
+        method: DELETE
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      loop: "{{ existing_ansible_jobs }}"
+      when: existing_ansible_jobs | length > 0
+    
+    # ============================================================
+    # 5. Créer un job de backup par nœud
+    # ============================================================
+    
+    - name: Créer les jobs de backup (un par nœud)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/cluster/backup"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          storage: "{{ pve_storage_id }}"
+          schedule: "{{ backup_schedule }}"
+          vmid: "{{ item.vmids | join(',') }}"
+          node: "{{ item.node }}"
+          all: 0
+          enabled: 1
+          mode: "snapshot"
+          compress: "{{ backup_compression }}"
+          notes-template: "Backup auto - {% raw %}{{ guestname }} {{ now }}{% endraw %}"
+          comment: "Job géré par Ansible - {{ item.node }}"
+          prune-backups: "keep-last={{ backup_retention.keep_last }},keep-daily={{ backup_retention.keep_daily }},keep-weekly={{ backup_retention.keep_weekly }},keep-monthly={{ backup_retention.keep_monthly }}"
+        status_code: [200, 201]
+      loop: "{{ backup_vms_per_node }}"
+      register: create_jobs_result
+    
+    # ============================================================
+    # 6. Récap final
+    # ============================================================
+    
+    - name: Récap de l'intégration
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════"
+          - "INTÉGRATION PBS ↔ PVE TERMINÉE"
+          - "════════════════════════════════════════════════"
+          - "Storage PBS dans PVE : {{ pve_storage_id }}"
+          - "Datastore PBS : {{ pbs_datastore }}"
+          - "Nombre de jobs créés : {{ backup_vms_per_node | length }}"
+          - "Détails des jobs :"
+          - "  • HYDRA-01 → VM 310 (VM-WEBSERV)"
+          - "  • HYDRA-03 → VM 311 (VM-DBSERV)"
+          - "  • HYDRA-04 → VM 312 (VM-FILESERV)"
+          - "Planning : {{ backup_schedule }}"
+          - "Rétention :"
+          - "  - keep-last : {{ backup_retention.keep_last }}"
+          - "  - keep-daily : {{ backup_retention.keep_daily }}"
+          - "  - keep-weekly : {{ backup_retention.keep_weekly }}"
+          - "  - keep-monthly : {{ backup_retention.keep_monthly }}"
+          - "════════════════════════════════════════════════"
+          - "Vérifier dans PVE :"
+          - "   https://{{ pve_host }}:{{ pve_port }}"
+          - "   → Datacenter → Storage : {{ pve_storage_id }}"
+          - "   → Datacenter → Backup : 3 nouveaux jobs"
+          - "════════════════════════════════════════════════"

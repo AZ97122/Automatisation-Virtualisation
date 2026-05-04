@@ -1,0 +1,14 @@
+---
+# Cluster Proxmox
+proxmox_api_host: 192.168.100.241
+proxmox_api_port: 8006
+
+# PBS
+pbs_hostname: vm-pbs
+pbs_ip: 192.168.100.221
+pbs_datastore_name: main-datastore
+pbs_datastore_path: /mnt/pbs-datastore
+
+# NAS NFS
+nas_ip: 192.168.100.250
+nas_nfs_export: /volume1/pbs-datastore

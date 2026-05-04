@@ -1,0 +1,239 @@
+---
+# ============================================================
+# Playbook de DISASTER RECOVERY
+# 
+# ATTENTION : Ce playbook RESTAURE une VM en PRODUCTION
+# Il remplace la VM existante (potentiellement détruite par un sinistre)
+# par sa version restaurée depuis PBS.
+# 
+# Cas d'usage :
+#   - Une VM est cassée/corrompue et doit être remplacée
+#   - Démonstration de capacité de restauration "feu réel"
+# 
+# Confirmation requise (--extra-vars confirm_dr=YES)
+# ============================================================
+
+- name: Disaster Recovery - Restauration d'une VM en production
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  
+  vars:
+    # VM à restaurer (la même que la source !)
+    target_vmid: 310
+    target_vm_name: "VM-WEBSERV"
+    target_node: "HYDRA-01"
+    
+    # Stockage cible
+    target_storage: "VMs-Disks"
+    
+    # Confirmation explicite (sécurité)
+    confirm_dr: "NO"
+    
+    # Stockage PBS source
+    pbs_storage_id: "pbs-main"
+  
+  vars_files:
+    - ../../artifacts/pve-credentials.yml
+    - ../../artifacts/vm-pbs/root/pbs-credentials.yml
+  
+  pre_tasks:
+    # ============================================================
+    # Sécurité : confirmation obligatoire
+    # ============================================================
+    
+    - name: Vérifier la confirmation explicite
+      ansible.builtin.fail:
+        msg: |
+          
+          ⚠️ATTENTION - DISASTER RECOVERY
+          
+          Ce playbook va :
+          1. Détruire la VM {{ target_vmid }} ({{ target_vm_name }}) si elle existe
+          2. Restaurer le backup PBS dans cette VM
+          3. La démarrer
+          
+          Pour confirmer, relance avec :
+            -e confirm_dr=YES
+      when: confirm_dr != "YES"
+    
+    - name: Afficher le plan d'action
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════"
+          - "DISASTER RECOVERY EN COURS"
+          - "════════════════════════════════════════════════"
+          - "VM cible : {{ target_vm_name }} (vmid {{ target_vmid }})"
+          - "Nœud : {{ target_node }}"
+          - "Source backup : {{ pbs_storage_id }}"
+          - "════════════════════════════════════════════════"
+  
+  tasks:
+    # ============================================================
+    # Étape 1 : Détruire la VM existante (simulation panne)
+    # ============================================================
+    
+    - name: Vérifier si la VM cible existe
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/cluster/resources?type=vm"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: cluster_resources
+    
+    - name: Identifier la VM existante
+      ansible.builtin.set_fact:
+        existing_vm: "{{ cluster_resources.json.data | selectattr('vmid', 'equalto', target_vmid) | list }}"
+    
+    - name: Stopper la VM si elle existe et tourne
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ existing_vm[0].node }}/qemu/{{ target_vmid }}/status/stop"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      when: existing_vm | length > 0 and existing_vm[0].status == "running"
+      failed_when: false
+    
+    - name: Attendre l'arrêt
+      ansible.builtin.pause:
+        seconds: 5
+      when: existing_vm | length > 0
+    
+    - name: Supprimer la VM existante (simulation panne)
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ existing_vm[0].node }}/qemu/{{ target_vmid }}?destroy-unreferenced-disks=1&purge=1"
+        method: DELETE
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        status_code: [200, 201]
+      when: existing_vm | length > 0
+      failed_when: false
+    
+    - name: Attendre la suppression
+      ansible.builtin.pause:
+        seconds: 10
+      when: existing_vm | length > 0
+    
+    - name: Confirmer la "panne"
+      ansible.builtin.debug:
+        msg: "VM {{ target_vmid }} détruite (simulation panne)"
+    
+    # ============================================================
+    # Étape 2 : Trouver le dernier backup
+    # ============================================================
+    
+    - name: Lister les snapshots du datastore PBS
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ target_node }}/storage/{{ pbs_storage_id }}/content"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: pbs_snapshots
+    
+    - name: Filtrer les snapshots de la VM
+      ansible.builtin.set_fact:
+        vm_snapshots: "{{ pbs_snapshots.json.data | selectattr('volid', 'search', 'vm/' + target_vmid|string + '/') | sort(attribute='ctime', reverse=true) | list }}"
+    
+    - name: Vérifier qu'il y a au moins un backup
+      ansible.builtin.fail:
+        msg: "Aucun backup trouvé pour la VM {{ target_vmid }} !"
+      when: vm_snapshots | length == 0
+    
+    - name: Sélectionner le dernier backup
+      ansible.builtin.set_fact:
+        latest_backup: "{{ vm_snapshots[0] }}"
+    
+    - name: Afficher le backup à restaurer
+      ansible.builtin.debug:
+        msg:
+          - "Backup sélectionné :"
+          - "   Volume : {{ latest_backup.volid }}"
+          - "   Taille : {{ (latest_backup.size / 1024 / 1024 / 1024) | round(2) }} GB"
+          - "   Date : {{ '%Y-%m-%d %H:%M:%S' | strftime(latest_backup.ctime | int) }}"
+    
+    # ============================================================
+    # Étape 3 : Restauration en production
+    # ============================================================
+    
+    - name: Démarrer la restauration
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ target_node }}/qemu"
+        method: POST
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          vmid: "{{ target_vmid }}"
+          name: "{{ target_vm_name }}"
+          archive: "{{ latest_backup.volid }}"
+          storage: "{{ target_storage }}"
+          start: 1
+        status_code: [200, 201]
+        timeout: 300
+      register: restore_task
+    
+    - name: Attendre la fin de la restauration
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ target_node }}/tasks/{{ restore_task.json.data }}/status"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: restore_status
+      until: restore_status.json.data.status == "stopped"
+      retries: 60
+      delay: 10
+    
+    - name: Vérifier le succès
+      ansible.builtin.fail:
+        msg: "La restauration a échoué : {{ restore_status.json.data.exitstatus }}"
+      when: restore_status.json.data.exitstatus != "OK"
+    
+    # ============================================================
+    # Étape 4 : Vérifier que la VM est de nouveau opérationnelle
+    # ============================================================
+    
+    - name: Vérifier que la VM tourne
+      ansible.builtin.uri:
+        url: "https://{{ pve_host }}:{{ pve_port }}/api2/json/nodes/{{ target_node }}/qemu/{{ target_vmid }}/status/current"
+        method: GET
+        validate_certs: no
+        headers:
+          Authorization: "PVEAPIToken={{ pve_token_id }}={{ pve_token_secret }}"
+        return_content: yes
+      register: vm_final_status
+      until: vm_final_status.json.data.status == "running"
+      retries: 12
+      delay: 5
+    
+    - name: Attendre que les services applicatifs démarrent
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Attente du démarrage complet des services..."
+    
+    # ============================================================
+    # Étape 5 : Récap
+    # ============================================================
+    
+    - name: Récap final
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════"
+          - "DISASTER RECOVERY TERMINÉ"
+          - "════════════════════════════════════════════════"
+          - "VM : {{ target_vm_name }} (vmid {{ target_vmid }})"
+          - "Statut : {{ vm_final_status.json.data.status }}"
+          - "Restaurée depuis : {{ '%Y-%m-%d %H:%M:%S' | strftime(latest_backup.ctime | int) }}"
+          - "════════════════════════════════════════════════"
+          - "Vérifications recommandées :"
+          - "   curl http://{{ '192.168.100.222' if target_vmid == 310 else 'IP-de-la-VM' }}"
+          - "════════════════════════════════════════════════"

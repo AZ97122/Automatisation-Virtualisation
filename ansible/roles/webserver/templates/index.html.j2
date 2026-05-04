@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ inventory_hostname }} - Serveur Web</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: rgba(255,255,255,0.1);
+            padding: 3rem;
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+            text-align: center;
+            max-width: 600px;
+        }
+        h1 { font-size: 3rem; margin: 0; }
+        .info { margin-top: 2rem; text-align: left; }
+        .info div { margin: 0.5rem 0; }
+        .label { font-weight: bold; opacity: 0.8; }
+        .value { color: #ffd700; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 {{ inventory_hostname }}</h1>
+        <p>Serveur web déployé automatiquement par Ansible</p>
+        <div class="info">
+            <div><span class="label">Hostname :</span> <span class="value">{{ inventory_hostname }}</span></div>
+            <div><span class="label">IP :</span> <span class="value">{{ ansible_host }}</span></div>
+            <div><span class="label">Rôle :</span> <span class="value">{{ backup_role | default('N/A') }}</span></div>
+            <div><span class="label">OS :</span> <span class="value">{{ ansible_distribution }} {{ ansible_distribution_version }}</span></div>
+            <div><span class="label">Déployé le :</span> <span class="value">{{ ansible_date_time.iso8601 }}</span></div>
+        </div>
+    </div>
+</body>
+</html>
