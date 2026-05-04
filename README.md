@@ -50,7 +50,7 @@ Déployer **de zéro** une infrastructure de sauvegarde fonctionnelle, automatis
 - Clés SSH configurées sur la VM de management vers les noeuds proxmox
 - Template cloud-init d'une vm debian
 
-### Installations et déploiement
+### Déploiement
 
 ``` bash
 # Se placer dans le dossier du projet "projet-backup-automation"
