@@ -36,7 +36,6 @@ Déployer **de zéro** une infrastructure de sauvegarde fonctionnelle, automatis
 - VM web server qui sera créée par Terraform puis configurée par Ansible
 - VM postgres qui sera créée par Terraform puis configurée par Ansible
 - VM samba qui sera créée par Terraform puis configurée par Ansible
-- 
 
 ---
 
